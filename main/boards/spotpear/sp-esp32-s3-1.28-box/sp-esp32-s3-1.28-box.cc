@@ -26,6 +26,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "power_manager.h"
+#include <esp_random.h>
+#include <string>
 
 #define TAG "Spotpear_ESP32_S3_1_28_BOX"
 
@@ -103,30 +105,186 @@ private:
 };
 
 
+// =====================================================================
+//  Pure big-eyes display: the whole round screen shows only a pair of
+//  blinking eyes. No text, no status bar, no chat bubbles.
+// =====================================================================
 class CustomLcdDisplay : public SpiLcdDisplay {
 public:
     CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle,
-                    esp_lcd_panel_handle_t panel_handle,
-                    int width,
-                    int height,
-                    int offset_x,
-                    int offset_y,
-                    bool mirror_x,
-                    bool mirror_y,
-                    bool swap_xy)
-        : SpiLcdDisplay(io_handle, panel_handle, width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy) {
-        // Note: UI customization should be done in SetupUI(), not in constructor
-        // to ensure lvgl objects are created before accessing them
-    }
+                     esp_lcd_panel_handle_t panel_handle,
+                     int width, int height,
+                     int offset_x, int offset_y,
+                     bool mirror_x, bool mirror_y, bool swap_xy)
+        : SpiLcdDisplay(io_handle, panel_handle, width, height,
+                        offset_x, offset_y, mirror_x, mirror_y, swap_xy) {}
 
-    virtual void SetupUI() override {
-        // Call parent SetupUI() first to create all lvgl objects
-        SpiLcdDisplay::SetupUI();
+    void SetupUI() override {
+        SpiLcdDisplay::SetupUI();   // build parent widgets first
 
         DisplayLockGuard lock(this);
-        // 由于屏幕是圆的，所以状态栏需要增加左右内边距
-        lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES * 0.33, 0);
-        lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES * 0.33, 0);
+
+        // 1) hide every text / icon widget
+        Hide(top_bar_);      Hide(status_bar_);  Hide(container_);
+        Hide(side_bar_);     Hide(bottom_bar_);  Hide(chat_message_label_);
+        Hide(emoji_image_);  Hide(emoji_label_); Hide(emoji_box_);
+
+        // 2) full black background
+        lv_obj_t* scr = lv_screen_active();
+        lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+        lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+        // 3) draw eyes + start random blink timer
+        BuildEyes(scr);
+        blink_timer_ = lv_timer_create(&CustomLcdDisplay::OnBlinkTimer, 2400, this);
+    }
+
+    bool SetEmotion(const char* emotion) override {
+        DisplayLockGuard lock(this);
+        ApplyEmotion(emotion != nullptr ? emotion : "");
+        return true;
+    }
+
+    void SetStatus(const char* status) override { (void)status; }
+
+    void SetChatMessage(const char* role, const char* content) override {
+        (void)role;
+        (void)content;
+    }
+
+private:
+    static constexpr int kEyeD    = 72;
+    static constexpr int kEyeOffX = 58;
+    static constexpr int kPupilD  = 30;
+
+    lv_obj_t* eye_l_   = nullptr;
+    lv_obj_t* eye_r_   = nullptr;
+    lv_obj_t* pupil_l_ = nullptr;
+    lv_obj_t* pupil_r_ = nullptr;
+    lv_obj_t* hl_l_    = nullptr;
+    lv_obj_t* hl_r_    = nullptr;
+    lv_timer_t* blink_timer_ = nullptr;
+
+    int eye_h_    = kEyeD;
+    int pupil_d_  = kPupilD;
+    int pupil_dy_ = 0;
+
+    static void Hide(lv_obj_t* o) {
+        if (o != nullptr) lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    static lv_obj_t* Circle(lv_obj_t* parent, int d, uint32_t rgb) {
+        lv_obj_t* o = lv_obj_create(parent);
+        lv_obj_remove_style_all(o);
+        lv_obj_set_size(o, d, d);
+        lv_obj_set_style_radius(o, d / 2, 0);   // radius = half of diameter -> circle
+        lv_obj_set_style_bg_color(o, lv_color_hex(rgb), 0);
+        lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+        lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+        return o;
+    }
+
+    void BuildEyes(lv_obj_t* scr) {
+        eye_l_ = Circle(scr, kEyeD, 0xF7F7F5);
+        eye_r_ = Circle(scr, kEyeD, 0xF7F7F5);
+        lv_obj_align(eye_l_, LV_ALIGN_CENTER, -kEyeOffX, 0);
+        lv_obj_align(eye_r_, LV_ALIGN_CENTER,  kEyeOffX, 0);
+
+        pupil_l_ = Circle(eye_l_, kPupilD, 0x0B0B0C);
+        pupil_r_ = Circle(eye_r_, kPupilD, 0x0B0B0C);
+        hl_l_ = Circle(eye_l_, 9, 0xFFFFFF);
+        hl_r_ = Circle(eye_r_, 9, 0xFFFFFF);
+
+        LayoutPupils();
+    }
+
+    void LayoutPupils() {
+        if (pupil_l_ == nullptr || pupil_r_ == nullptr) return;
+        lv_obj_set_size(pupil_l_, pupil_d_, pupil_d_);
+        lv_obj_set_size(pupil_r_, pupil_d_, pupil_d_);
+        lv_obj_align(pupil_l_, LV_ALIGN_CENTER, 0, pupil_dy_);
+        lv_obj_align(pupil_r_, LV_ALIGN_CENTER, 0, pupil_dy_);
+
+        int hl = pupil_d_ / 3;
+        if (hl < 4) hl = 4;
+        lv_obj_set_size(hl_l_, hl, hl);
+        lv_obj_set_size(hl_r_, hl, hl);
+        lv_obj_align(hl_l_, LV_ALIGN_CENTER, pupil_d_ / 5, pupil_dy_ - pupil_d_ / 4);
+        lv_obj_align(hl_r_, LV_ALIGN_CENTER, pupil_d_ / 5, pupil_dy_ - pupil_d_ / 4);
+    }
+
+    static void OnEyeOpenAnim(void* var, int32_t v) {
+        auto* self = static_cast<CustomLcdDisplay*>(var);
+        int h = (self->eye_h_ * v) / 256;
+        if (h < 6) h = 6;
+
+        lv_obj_set_height(self->eye_l_, h);
+        lv_obj_set_height(self->eye_r_, h);
+        lv_obj_align(self->eye_l_, LV_ALIGN_CENTER, -kEyeOffX, 0);
+        lv_obj_align(self->eye_r_, LV_ALIGN_CENTER,  kEyeOffX, 0);
+
+        lv_opa_t opa = (v > 96) ? LV_OPA_COVER : LV_OPA_TRANSP;
+        lv_obj_set_style_opa(self->pupil_l_, opa, 0);
+        lv_obj_set_style_opa(self->pupil_r_, opa, 0);
+        lv_obj_set_style_opa(self->hl_l_, opa, 0);
+        lv_obj_set_style_opa(self->hl_r_, opa, 0);
+
+        if (v >= 255) self->LayoutPupils();
+    }
+
+    void Blink() {
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, this);
+        lv_anim_set_exec_cb(&a, &CustomLcdDisplay::OnEyeOpenAnim);
+        lv_anim_set_values(&a, 256, 0);
+        lv_anim_set_duration(&a, 80);
+        lv_anim_set_reverse_duration(&a, 130);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+        lv_anim_start(&a);
+    }
+
+    static void OnBlinkTimer(lv_timer_t* t) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_timer_get_user_data(t));
+        if (self == nullptr) return;
+        self->Blink();
+        lv_timer_set_period(t, 2200 + (esp_random() % 2800));
+    }
+
+    void ApplyEmotion(const std::string& e) {
+        if (eye_l_ == nullptr || eye_r_ == nullptr) return;   // before SetupUI
+
+        int h = kEyeD, d = kPupilD, dy = 0;
+
+        if      (e.find("happy") != std::string::npos || e.find("laugh") != std::string::npos) {
+            h = 30;  d = 30;  dy = 0;
+        } else if (e.find("sad") != std::string::npos) {
+            h = 58;  d = 24;  dy = 6;
+        } else if (e.find("angry") != std::string::npos) {
+            h = 46;  d = 24;  dy = -8;
+        } else if (e.find("surprise") != std::string::npos || e.find("shock") != std::string::npos) {
+            h = 86;  d = 22;  dy = 0;
+        } else if (e.find("sleep") != std::string::npos) {
+            h = 12;  d = 12;  dy = 0;
+        } else if (e.find("think") != std::string::npos) {
+            h = 60;  d = 26;  dy = -6;
+        }
+
+        eye_h_    = h;
+        pupil_d_  = d;
+        pupil_dy_ = dy;
+
+        lv_obj_set_height(eye_l_, h);
+        lv_obj_set_height(eye_r_, h);
+        lv_obj_align(eye_l_, LV_ALIGN_CENTER, -kEyeOffX, 0);
+        lv_obj_align(eye_r_, LV_ALIGN_CENTER,  kEyeOffX, 0);
+        LayoutPupils();
+
+        lv_obj_set_style_opa(pupil_l_, LV_OPA_COVER, 0);
+        lv_obj_set_style_opa(pupil_r_, LV_OPA_COVER, 0);
+        lv_obj_set_style_opa(hl_l_, LV_OPA_COVER, 0);
+        lv_obj_set_style_opa(hl_r_, LV_OPA_COVER, 0);
     }
 };
 
